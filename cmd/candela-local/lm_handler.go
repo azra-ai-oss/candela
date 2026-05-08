@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/candelahq/candela/pkg/costcalc"
 	"github.com/candelahq/candela/pkg/proxy"
 	"github.com/candelahq/candela/pkg/runtime"
+	"golang.org/x/sync/singleflight"
 )
 
 // lmHandler implements a smart HTTP handler for the LM Studio compat listener.
@@ -30,7 +32,10 @@ type lmHandler struct {
 	cloudModels  map[string]string      // model ID → provider name
 	calc         *costcalc.Calculator   // pricing calculator (for filtering unpriced models)
 
-	localModels sync.Map // model ID string → bool (cached for fast routing)
+	localModels  sync.Map // model ID string → bool (cached for fast routing)
+	remoteModels sync.Map // model ID string → bool (cached from remote /v1/models)
+
+	remoteFetchGroup singleflight.Group // deduplicates concurrent lazy fetches
 }
 
 // newLMHandler creates a smart LM compat handler that merges local + remote + cloud
@@ -133,6 +138,20 @@ func (h *lmHandler) serveModels(w http.ResponseWriter, r *http.Request) {
 	remoteModels := h.fetchRemoteModels(r)
 	merged = append(merged, remoteModels...)
 
+	// Cache remote model IDs for alias resolution.
+	newRemoteSet := make(map[string]bool, len(remoteModels))
+	for _, m := range remoteModels {
+		newRemoteSet[m.ID] = true
+		h.remoteModels.Store(m.ID, true)
+	}
+	// Remove stale remote entries.
+	h.remoteModels.Range(func(key, _ any) bool {
+		if !newRemoteSet[key.(string)] {
+			h.remoteModels.Delete(key)
+		}
+		return true
+	})
+
 	// 4. Return merged OpenAI-format response.
 	w.Header().Set("Content-Type", "application/json")
 	resp := openaiModelList{Object: "list", Data: merged}
@@ -183,6 +202,14 @@ func (h *lmHandler) serveChat(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &req)
 
+	// Resolve model aliases (e.g. "claude-sonnet-4" → "claude-sonnet-4-20250514").
+	resolved := h.resolveModel(req.Model)
+	if resolved != req.Model {
+		slog.Info("lm handler: resolved model alias", "from", req.Model, "to", resolved)
+		body = rewriteModelInBody(body, req.Model, resolved)
+		req.Model = resolved
+	}
+
 	// Replay body for the proxy.
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
@@ -232,18 +259,116 @@ func (h *lmHandler) isLocalModel(model string) bool {
 	return false
 }
 
+// resolveModel resolves a model name to its canonical ID using prefix matching.
+// For example, "claude-sonnet-4" resolves to "claude-sonnet-4-20250514" if that
+// is the only model with that prefix. If zero or multiple models match, the
+// original name is returned unchanged.
+func (h *lmHandler) resolveModel(model string) string {
+	if model == "" {
+		return model
+	}
+
+	// Collect all known model IDs.
+	var allModels []string
+	h.localModels.Range(func(key, _ any) bool {
+		allModels = append(allModels, key.(string))
+		return true
+	})
+	for id := range h.cloudModels {
+		allModels = append(allModels, id)
+	}
+
+	// Lazy-populate remote models if cache is empty and we have a remote proxy.
+	// Uses singleflight to prevent thundering herd on concurrent first requests.
+	remoteEmpty := true
+	h.remoteModels.Range(func(_, _ any) bool {
+		remoteEmpty = false
+		return false // stop after first entry
+	})
+	if remoteEmpty && h.remoteProxy != nil {
+		_, _, _ = h.remoteFetchGroup.Do("fetch-remote-models", func() (any, error) {
+			req, _ := http.NewRequest(http.MethodGet, "/v1/models", nil)
+			if req != nil {
+				remote := h.fetchRemoteModels(req)
+				for _, m := range remote {
+					h.remoteModels.Store(m.ID, true)
+				}
+			}
+			return nil, nil
+		})
+	}
+
+	h.remoteModels.Range(func(key, _ any) bool {
+		allModels = append(allModels, key.(string))
+		return true
+	})
+
+	// Exact match → no resolution needed.
+	for _, id := range allModels {
+		if id == model {
+			return model
+		}
+	}
+
+	// Prefix match → resolve if exactly one model matches.
+	var matches []string
+	for _, id := range allModels {
+		if strings.HasPrefix(id, model) {
+			matches = append(matches, id)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+
+	// Ambiguous or no match — return original.
+	return model
+}
+
+// rewriteModelInBody replaces the model field value in a JSON request body.
+// Targets the "model" key specifically to avoid corrupting user message
+// content that might contain the model name as plain text.
+// Handles optional whitespace around the JSON colon ("model": "value").
+func rewriteModelInBody(body []byte, oldModel, newModel string) []byte {
+	oldJSON, _ := json.Marshal(oldModel)
+	newJSON, _ := json.Marshal(newModel)
+	// Match "model"\s*:\s*"oldValue" to handle both compact and pretty JSON.
+	pattern := regexp.MustCompile(`("model"\s*:\s*)` + regexp.QuoteMeta(string(oldJSON)))
+	rewritten := pattern.ReplaceAll(body, append([]byte(`${1}`), newJSON...))
+	if !bytes.Equal(rewritten, body) {
+		return rewritten
+	}
+	// Fallback: body unchanged (key not found), return original.
+	return body
+}
+
 // responseRecorder captures a proxy response for parsing.
+// Buffer is capped at maxRecorderBytes to prevent OOM on large responses.
 type responseRecorder struct {
 	headers    http.Header
 	body       bytes.Buffer
 	statusCode int
+	capped     bool
 }
+
+const maxRecorderBytes = 2 << 20 // 2MB — enough for /v1/models JSON
 
 func (r *responseRecorder) Header() http.Header { return r.headers }
 func (r *responseRecorder) Write(b []byte) (int, error) {
 	if r.statusCode == 0 {
 		r.statusCode = http.StatusOK // match net/http implicit behavior
 	}
-	return r.body.Write(b)
+	if !r.capped {
+		if r.body.Len()+len(b) > maxRecorderBytes {
+			remaining := maxRecorderBytes - r.body.Len()
+			if remaining > 0 {
+				r.body.Write(b[:remaining])
+			}
+			r.capped = true
+		} else {
+			r.body.Write(b)
+		}
+	}
+	return len(b), nil
 }
 func (r *responseRecorder) WriteHeader(code int) { r.statusCode = code }

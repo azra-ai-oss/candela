@@ -89,6 +89,8 @@ type Proxy struct {
 	// Optional dependencies for team-mode features.
 	users    storage.UserStore     // Budget deduction (nil = no budget tracking)
 	budgetCk *notify.BudgetChecker // Budget threshold notifications (nil = no alerts)
+
+	compatModels []CompatModel // configured models for per-provider /models responses
 }
 
 // Config holds proxy configuration.
@@ -192,6 +194,9 @@ func (p *Proxy) RegisterCompatRoutes(mux *http.ServeMux, models []CompatModel) {
 	// Build the /v1/models response once at startup.
 	modelList := buildModelsResponse(pricedModels)
 
+	// Store models for per-provider /models responses in handleProxy.
+	p.compatModels = pricedModels
+
 	// GET /v1/models — return the configured model list (OpenAI-compatible).
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -235,6 +240,23 @@ func (p *Proxy) RegisterCompatRoutes(mux *http.ServeMux, models []CompatModel) {
 		}
 
 		providerName, ok := modelToProvider[req.Model]
+		if !ok {
+			// Try prefix-based alias resolution (e.g. "claude-sonnet-4" → "claude-sonnet-4-20250514").
+			var matches []string
+			for id := range modelToProvider {
+				if strings.HasPrefix(id, req.Model) {
+					matches = append(matches, id)
+				}
+			}
+			if len(matches) == 1 {
+				resolved := matches[0]
+				slog.Info("compat: resolved model alias", "from", req.Model, "to", resolved)
+				providerName = modelToProvider[resolved]
+				ok = true
+				// Rewrite the model field in the body so upstream gets the canonical ID.
+				body = rewriteModelField(body, resolved)
+			}
+		}
 		if !ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
@@ -299,9 +321,33 @@ func buildModelsResponse(models []CompatModel) []byte {
 	return b
 }
 
+// rewriteModelField replaces the "model" field in a JSON request body with newModel.
+// Targets the "model" key specifically to avoid corrupting user message
+// content that might contain the model name as plain text.
+// Handles optional whitespace around the JSON colon ("model": "value").
+func rewriteModelField(body []byte, newModel string) []byte {
+	// Find the current model value by parsing first.
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.Model == "" {
+		return body
+	}
+	oldJSON, _ := json.Marshal(req.Model)
+	newJSON, _ := json.Marshal(newModel)
+	// Match "model"\s*:\s*"oldValue" to handle both compact and pretty JSON.
+	pattern := regexp.MustCompile(`("model"\s*:\s*)` + regexp.QuoteMeta(string(oldJSON)))
+	rewritten := pattern.ReplaceAll(body, append([]byte(`${1}`), newJSON...))
+	if !bytes.Equal(rewritten, body) {
+		return rewritten
+	}
+	return body
+}
+
 // requestIDPattern validates that a request ID contains only safe characters
 // (alphanumeric, hyphens) and is between 1-128 chars.
 // This prevents log injection and trace poisoning via crafted X-Request-ID headers.
+// Also used to validate X-Session-Id.
 var requestIDPattern = regexp.MustCompile(`^[a-zA-Z0-9\-]{1,128}$`)
 
 func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +361,11 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Accept session ID from candela-local (or other clients).
+	// Validate to prevent log/trace injection — same rules as request ID.
 	sessionID := r.Header.Get("X-Session-Id")
+	if sessionID != "" && !requestIDPattern.MatchString(sessionID) {
+		sessionID = "" // invalid → discard
+	}
 
 	// Extract W3C Trace Context for trace correlation with OTel-instrumented
 	// callers (e.g. Google ADK, LangChain). When present, the proxy span
@@ -390,11 +440,18 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Handle GET /v1/models — return synthetic model list for OpenAI-compatible clients.
+	// Handle GET /v1/models — return configured models for this provider.
+	// Build per-provider model list from the proxy's registered providers/models.
 	if r.Method == http.MethodGet && strings.HasSuffix(upstreamPath, "/models") {
+		// Collect models configured for this specific provider.
+		var providerModels []CompatModel
+		for _, m := range p.compatModels {
+			if m.Provider == providerName {
+				providerModels = append(providerModels, m)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		modelsResp := `{"object":"list","data":[{"id":"claude-sonnet-4-20250514","object":"model","created":1700000000,"owned_by":"anthropic"}]}`
-		_, _ = w.Write([]byte(modelsResp))
+		_, _ = w.Write(buildModelsResponse(providerModels))
 		return
 	}
 
