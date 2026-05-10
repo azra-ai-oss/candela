@@ -42,6 +42,7 @@
             golangci-lint
             gotools
             govulncheck
+            actionlint
 
             # Protobuf / Buf
             buf
@@ -92,6 +93,7 @@
             echo "   Python: $(python3 --version | cut -d' ' -f2)"
           '';
         };
+
       }
     );
 }
