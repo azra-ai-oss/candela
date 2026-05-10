@@ -19,6 +19,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"cloud.google.com/go/firestore"
 	"github.com/google/uuid"
@@ -275,14 +276,38 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 // Budgets
 // ──────────────────────────────────────────
 
+// budgetConfigDocID is the Firestore document ID of the stable budget
+// configuration document within the budgets subcollection.
+// Period spend docs use YYYY-MM-DD keys; "config" never collides with those.
+const budgetConfigDocID = "config"
+
 func (s *Store) SetBudget(ctx context.Context, budget *storage.BudgetRecord) error {
 	if budget.PeriodKey == "" {
 		budget.PeriodKey = currentPeriodKey(budget.PeriodType)
 	}
 	userID := sanitizeID(budget.UserID)
-	ref := s.client.Collection(usersCol).Doc(userID).
-		Collection(budgetsCol).Doc(budget.PeriodKey)
-	_, err := ref.Set(ctx, budget)
+	userRef := s.client.Collection(usersCol).Doc(userID)
+
+	// Write 1: stable config doc — survives daily period rollover.
+	// This is the only place limit_usd/period_type are persisted long-term.
+	configRef := userRef.Collection(budgetsCol).Doc(budgetConfigDocID)
+	_, err := configRef.Set(ctx, map[string]interface{}{
+		"limit_usd":   budget.LimitUSD,
+		"period_type": budget.PeriodType,
+		"user_id":     userID,
+	})
+	if err != nil {
+		return fmt.Errorf("firestoredb: setting budget config: %w", err)
+	}
+
+	// Write 2: today's spend doc — config fields only (Merge preserves counters).
+	ref := userRef.Collection(budgetsCol).Doc(budget.PeriodKey)
+	_, err = ref.Set(ctx, budget, firestore.Merge(
+		firestore.FieldPath{"user_id"},
+		firestore.FieldPath{"limit_usd"},
+		firestore.FieldPath{"period_type"},
+		firestore.FieldPath{"period_key"},
+	))
 	if err != nil {
 		return fmt.Errorf("firestoredb: setting budget: %w", err)
 	}
@@ -292,16 +317,62 @@ func (s *Store) SetBudget(ctx context.Context, budget *storage.BudgetRecord) err
 func (s *Store) GetBudget(ctx context.Context, userID string) (*storage.BudgetRecord, error) {
 	periodKey := currentPeriodKey("daily")
 	userID = sanitizeID(userID)
-	ref := s.client.Collection(usersCol).Doc(userID).
-		Collection(budgetsCol).Doc(periodKey)
+	userRef := s.client.Collection(usersCol).Doc(userID)
+	ref := userRef.Collection(budgetsCol).Doc(periodKey)
 	snap, err := ref.Get(ctx)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
-			return nil, nil // No budget set — not an error.
+			// #9: Period doc missing — check config doc for auto-rollover.
+			// This happens every day after midnight UTC until the first call
+			// triggers DeductSpend (which auto-creates the period doc).
+			return s.budgetFromConfig(ctx, userRef, userID, periodKey)
 		}
 		return nil, fmt.Errorf("firestoredb: getting budget: %w", err)
 	}
 	return snapToBudget(snap)
+}
+
+// budgetFromConfig synthesizes a zero-spend BudgetRecord from the stable
+// config doc. Returns nil (no error) if no config exists yet.
+func (s *Store) budgetFromConfig(ctx context.Context, userRef *firestore.DocumentRef, userID, periodKey string) (*storage.BudgetRecord, error) {
+	configRef := userRef.Collection(budgetsCol).Doc(budgetConfigDocID)
+	configSnap, err := configRef.Get(ctx)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, nil // no budget configured at all
+		}
+		return nil, fmt.Errorf("firestoredb: reading budget config: %w", err)
+	}
+	data := configSnap.Data()
+	// #E: Firestore stores whole numbers as int64, not float64.
+	// Use firestoreFloat to handle both numeric types.
+	limitUSD := firestoreFloat(data["limit_usd"])
+	periodType, _ := data["period_type"].(string)
+	if periodType == "" {
+		periodType = "daily"
+	}
+	return &storage.BudgetRecord{
+		UserID:     userID,
+		LimitUSD:   limitUSD,
+		PeriodType: periodType,
+		PeriodKey:  periodKey,
+		// Spend counters start at 0 — no calls yet this period.
+	}, nil
+}
+
+// firestoreFloat safely converts a Firestore numeric field to float64.
+// Firestore stores whole-number values as int64 (not float64), so a plain
+// .(float64) assertion silently returns 0.0 for values like 100 or 50.
+func firestoreFloat(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int64:
+		return float64(n)
+	case int32:
+		return float64(n)
+	}
+	return 0
 }
 
 func (s *Store) ResetSpend(ctx context.Context, userID string) error {
@@ -309,10 +380,18 @@ func (s *Store) ResetSpend(ctx context.Context, userID string) error {
 	userID = sanitizeID(userID)
 	ref := s.client.Collection(usersCol).Doc(userID).
 		Collection(budgetsCol).Doc(periodKey)
-	_, err := ref.Update(ctx, []firestore.Update{
-		{Path: "spent_usd", Value: 0},
-		{Path: "tokens_used", Value: 0},
-	})
+	// #H: Use Set+Merge instead of Update so this is idempotent on a missing
+	// period doc (new day). Update fails with NOT_FOUND when the spend doc
+	// doesn't exist yet (e.g. called by an admin just after midnight).
+	_, err := ref.Set(ctx, map[string]any{
+		"spent_usd":       0,
+		"tokens_used":     0,
+		"all_tokens_used": 0,
+	}, firestore.Merge(
+		firestore.FieldPath{"spent_usd"},
+		firestore.FieldPath{"tokens_used"},
+		firestore.FieldPath{"all_tokens_used"},
+	))
 	if err != nil {
 		return fmt.Errorf("firestoredb: resetting spend: %w", err)
 	}
@@ -387,6 +466,21 @@ func (s *Store) RevokeGrant(ctx context.Context, userID, grantID string) error {
 // Budget Enforcement
 // ──────────────────────────────────────────
 
+// CheckBudget returns whether the user has sufficient funds (grants + budget)
+// for an estimated call cost.
+//
+// # TOCTOU note (#G)
+//
+// CheckBudget and DeductSpend are intentionally separate operations. There is
+// a small window between a passing CheckBudget and the subsequent DeductSpend
+// where another concurrent request could exhaust the remaining balance. This
+// means a user near their limit may occasionally make one extra call.
+//
+// The risk is bounded and acceptable: DeductSpend still records actual spend
+// post-fact, and the pre-flight floor ($0.001) prevents truly zero-balance
+// calls from succeeding. A future improvement would collapse the two into a
+// single Firestore transaction, but that would require reading grants inside
+// the DeductSpend transaction (significant latency increase on the hot path).
 func (s *Store) CheckBudget(ctx context.Context, userID string, estimatedCostUSD float64) (*storage.BudgetCheckResult, error) {
 	// Sum remaining grants.
 	grants, err := s.ListGrants(ctx, userID, true)
@@ -425,9 +519,12 @@ func (s *Store) DeductSpend(ctx context.Context, userID string, costUSD float64,
 	return s.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
 		// ── ALL READS FIRST (Firestore requirement) ──
 
-		userID = sanitizeID(userID)
+		// Sanitize into a local so we don't mutate the outer parameter.
+		// Firestore transactions auto-retry on contention — mutating the outer
+		// userID would cause it to be double-sanitized on each retry.
+		localUserID := sanitizeID(userID)
 		// Read 1: Load active grants (earliest-expiring first).
-		grantsRef := s.client.Collection(usersCol).Doc(userID).
+		grantsRef := s.client.Collection(usersCol).Doc(localUserID).
 			Collection(grantsCol)
 		grantsSnaps, err := tx.Documents(grantsRef.
 			Where("expires_at", ">", time.Now().UTC()).
@@ -436,20 +533,109 @@ func (s *Store) DeductSpend(ctx context.Context, userID string, costUSD float64,
 			return fmt.Errorf("firestoredb: loading grants in tx: %w", err)
 		}
 
-		// Read 2: Load daily budget.
+		// Read 2: Load daily budget (period spend doc).
 		periodKey := currentPeriodKey("daily")
-		budgetRef := s.client.Collection(usersCol).Doc(userID).
-			Collection(budgetsCol).Doc(periodKey)
+		userRef := s.client.Collection(usersCol).Doc(localUserID)
+		budgetRef := userRef.Collection(budgetsCol).Doc(periodKey)
 		budgetSnap, err := tx.Get(budgetRef)
 		if err != nil && status.Code(err) != codes.NotFound {
 			return fmt.Errorf("firestoredb: getting budget in tx: %w", err)
+		}
+
+		// Read 3: Config doc for auto-rollover (#9).
+		// When the period doc is NotFound (new day), read the stable config
+		// to get limit_usd and auto-create the spend doc in this transaction.
+		configRef := userRef.Collection(budgetsCol).Doc(budgetConfigDocID)
+		configSnap, configErr := tx.Get(configRef)
+		if configErr != nil && status.Code(configErr) != codes.NotFound {
+			return fmt.Errorf("firestoredb: getting budget config in tx: %w", configErr)
 		}
 
 		// ── ALL WRITES AFTER READS ──
 
 		remaining := costUSD
 
-		// Write 1: Deduct from grants first (waterfall).
+		// Write 1: Deduct from daily budget first.
+		// Budget is the developer's primary daily pool. Grants act as overflow
+		// when the budget is exhausted (budget-first waterfall).
+		var b *storage.BudgetRecord
+		var isNewPeriod bool
+		if budgetSnap != nil && budgetSnap.Exists() {
+			b, err = snapToBudget(budgetSnap)
+			if err != nil {
+				return err
+			}
+		} else if configSnap != nil && configSnap.Exists() {
+			// #9: Auto-rollover — create today's spend doc from config.
+			data := configSnap.Data()
+			// #E: firestoreFloat handles int64 (Firestore whole numbers) and float64.
+			limitUSD := firestoreFloat(data["limit_usd"])
+			periodType, _ := data["period_type"].(string)
+			if periodType == "" {
+				periodType = "daily"
+			}
+			b = &storage.BudgetRecord{
+				UserID:     localUserID,
+				LimitUSD:   limitUSD,
+				PeriodType: periodType,
+				PeriodKey:  periodKey,
+			}
+			isNewPeriod = true
+		}
+
+		if b != nil {
+			budgetAvailable := b.LimitUSD - b.SpentUSD
+			if budgetAvailable < 0 {
+				budgetAvailable = 0
+			}
+			budgetDeduct := min(remaining, budgetAvailable)
+			if budgetDeduct > 0 || tokens > 0 {
+				// Attribute tokens proportional to the budget fraction absorbed.
+				// If budget absorbs 100% of cost → 100% of tokens.
+				// If budget absorbs 30% → 30% of tokens (remainder lands on grants).
+				budgetTokens := tokens
+				if costUSD > 0 && budgetDeduct < costUSD {
+					budgetTokens = int64(math.Round(float64(tokens) * (budgetDeduct / costUSD)))
+				}
+				// all_tokens_used is always the full token count regardless of
+				// whether grants absorb any cost — used by GetMyBudget fast path.
+				if isNewPeriod {
+					// Auto-rollover: create the period doc atomically with initial spend.
+					// tx.Update would fail on a nonexistent document.
+					newDoc := &storage.BudgetRecord{
+						UserID:        localUserID,
+						LimitUSD:      b.LimitUSD,
+						PeriodType:    b.PeriodType,
+						PeriodKey:     periodKey,
+						SpentUSD:      budgetDeduct,
+						TokensUsed:    budgetTokens,
+						AllTokensUsed: tokens,
+					}
+					if err := tx.Set(budgetRef, newDoc); err != nil {
+						return fmt.Errorf("firestoredb: creating new period budget: %w", err)
+					}
+				} else {
+					updates := []firestore.Update{
+						{Path: "all_tokens_used", Value: b.AllTokensUsed + tokens},
+						{Path: "tokens_used", Value: b.TokensUsed + budgetTokens},
+					}
+					if budgetDeduct > 0 {
+						updates = append(updates, firestore.Update{
+							Path:  "spent_usd",
+							Value: b.SpentUSD + budgetDeduct,
+						})
+					}
+					if err := tx.Update(budgetRef, updates); err != nil {
+						return fmt.Errorf("firestoredb: deducting from budget: %w", err)
+					}
+				}
+			}
+			remaining -= budgetDeduct
+		}
+
+		// Write 2: Overflow into grants (earliest-expiry-first).
+		// Draining the soonest-to-expire grant first minimises waste from
+		// grants expiring with unused balance.
 		for _, snap := range grantsSnaps {
 			if remaining <= 0 {
 				break
@@ -471,26 +657,6 @@ func (s *Store) DeductSpend(ctx context.Context, userID string, costUSD float64,
 			remaining -= deduct
 		}
 
-		// Write 2: Deduct remainder from budget.
-		if remaining > 0 && budgetSnap != nil && budgetSnap.Exists() {
-			b, err := snapToBudget(budgetSnap)
-			if err != nil {
-				return err
-			}
-			// Proportionally attribute tokens based on the cost fraction
-			// absorbed by the budget (vs. grants). If $0.10 total and the
-			// budget absorbs $0.02, it gets 20% of the tokens.
-			budgetTokens := tokens
-			if costUSD > 0 {
-				budgetTokens = int64(math.Round(float64(tokens) * (remaining / costUSD)))
-			}
-			if err := tx.Update(budgetRef, []firestore.Update{
-				{Path: "spent_usd", Value: b.SpentUSD + remaining},
-				{Path: "tokens_used", Value: b.TokensUsed + budgetTokens},
-			}); err != nil {
-				return fmt.Errorf("firestoredb: deducting from budget: %w", err)
-			}
-		}
 		return nil
 	})
 }
@@ -647,17 +813,50 @@ func snapToAudit(snap *firestore.DocumentSnapshot) (*storage.AuditRecord, error)
 	return &a, nil
 }
 
-// currentPeriodKey returns the daily period key for the current time.
-func currentPeriodKey(_ string) string {
-	return time.Now().UTC().Format("2006-01-02")
+// currentPeriodKey returns the period key for the given period type.
+// Supported period types: "daily" (YYYY-MM-DD), "monthly" (YYYY-MM),
+// "weekly" (YYYY-WNN). Unknown types fall back to "daily".
+// #F: was `func currentPeriodKey(_ string)` — the argument was always
+// ignored, so monthly and weekly budgets always rolled over daily.
+func currentPeriodKey(periodType string) string {
+	now := time.Now().UTC()
+	switch periodType {
+	case "monthly":
+		return now.Format("2006-01")
+	case "weekly":
+		_, week := now.ISOWeek()
+		return fmt.Sprintf("%d-W%02d", now.Year(), week)
+	default: // "daily" and anything unrecognised
+		return now.Format("2006-01-02")
+	}
 }
 
 // sanitizeID makes a generic string (like an email) safe for use as a
-// Firestore document ID by lowercasing, replacing slashes, and escaping
-// Firestore's reserved __.*__ pattern (IDs that start and end with double
-// underscores are reserved by Firestore and will cause writes to fail).
+// Firestore document ID by lowercasing, replacing path-separator and
+// consecutive-dot characters, and enforcing Firestore's 1500-byte limit.
+//
+// Rules applied:
+//   - Lowercase (emails are case-insensitive)
+//   - `/` → `_` (Firestore path separator)
+//   - `..` → `._` (consecutive dots are disallowed in Firestore IDs)
+//   - Truncate to 1500 bytes (Firestore document ID limit) — #I
+//   - Prefix `u_` if the result matches the reserved `__.*__` pattern
 func sanitizeID(id string) string {
-	s := strings.ReplaceAll(strings.ToLower(id), "/", "_")
+	s := strings.ToLower(id)
+	s = strings.ReplaceAll(s, "/", "_")
+	// Firestore disallows consecutive dots; replace with a visually-distinct
+	// separator that keeps the ID human-readable.
+	s = strings.ReplaceAll(s, "..", "._")
+	// #I: Firestore document IDs must be ≤ 1500 bytes.
+	// Walk back from byte 1500 to find a valid UTF-8 boundary to avoid
+	// splitting a multi-byte character (which would produce an invalid ID).
+	if len(s) > 1500 {
+		end := 1500
+		for end > 0 && !utf8.ValidString(s[:end]) {
+			end--
+		}
+		s = s[:end]
+	}
 	// Firestore reserves document IDs matching __.*__ (e.g. __user__@example.com).
 	if len(s) >= 4 && strings.HasPrefix(s, "__") && strings.HasSuffix(s, "__") {
 		s = "u_" + s

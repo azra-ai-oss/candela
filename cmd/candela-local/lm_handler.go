@@ -326,20 +326,33 @@ func (h *lmHandler) resolveModel(model string) string {
 }
 
 // rewriteModelInBody replaces the model field value in a JSON request body.
-// Targets the "model" key specifically to avoid corrupting user message
-// content that might contain the model name as plain text.
-// Handles optional whitespace around the JSON colon ("model": "value").
+// Uses a regex to match `"model"` followed by optional whitespace, a colon,
+// optional whitespace, and the JSON-encoded old model value. Only the first
+// occurrence is replaced to avoid corrupting user message content that happens
+// to contain the same model name (e.g. in few-shot examples).
 func rewriteModelInBody(body []byte, oldModel, newModel string) []byte {
 	oldJSON, _ := json.Marshal(oldModel)
 	newJSON, _ := json.Marshal(newModel)
-	// Match "model"\s*:\s*"oldValue" to handle both compact and pretty JSON.
-	pattern := regexp.MustCompile(`("model"\s*:\s*)` + regexp.QuoteMeta(string(oldJSON)))
-	rewritten := pattern.ReplaceAll(body, append([]byte(`${1}`), newJSON...))
-	if !bytes.Equal(rewritten, body) {
-		return rewritten
+	// Build a pattern that tolerates optional whitespace around the colon.
+	// regexp.QuoteMeta escapes the JSON-encoded string (handles special chars).
+	pattern := `"model"\s*:\s*` + regexp.QuoteMeta(string(oldJSON))
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		// Should never happen — fallback to compact no-whitespace replace.
+		target := append([]byte(`"model":`), oldJSON...)
+		replacement := append([]byte(`"model":`), newJSON...)
+		return bytes.Replace(body, target, replacement, 1)
 	}
-	// Fallback: body unchanged (key not found), return original.
-	return body
+	replacement := append([]byte(`"model":`), newJSON...)
+	loc := re.FindIndex(body)
+	if loc == nil {
+		return body
+	}
+	result := make([]byte, 0, len(body)-(loc[1]-loc[0])+len(replacement))
+	result = append(result, body[:loc[0]]...)
+	result = append(result, replacement...)
+	result = append(result, body[loc[1]:]...)
+	return result
 }
 
 // responseRecorder captures a proxy response for parsing.

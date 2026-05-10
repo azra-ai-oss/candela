@@ -8,7 +8,6 @@ import (
 	"time"
 
 	connect "connectrpc.com/connect"
-	typespb "github.com/candelahq/candela/gen/go/candela/types"
 	v1 "github.com/candelahq/candela/gen/go/candela/v1"
 	"github.com/candelahq/candela/pkg/auth"
 	"github.com/candelahq/candela/pkg/storage"
@@ -115,7 +114,16 @@ func (h *DashboardHandler) GetLatencyPercentiles(
 	return connect.NewResponse(&v1.GetLatencyPercentilesResponse{}), nil
 }
 
-// GetMyUsage returns the calling user's personal usage summary + budget context.
+// GetMyUsage returns the calling user's personal usage summary (BigQuery).
+//
+// This is a pure BigQuery handler — ~800ms, authoritative token/cost split.
+// For real-time budget progress bars and grant remaining, call
+// UserService.GetMyBudget (~80ms, Firestore-only) in parallel.
+//
+// Client rendering pattern:
+//
+//	UserService.GetMyBudget()     → renders budget bar + grant bars (~80ms)
+//	DashboardService.GetMyUsage() → renders token counts + model table (~800ms)
 func (h *DashboardHandler) GetMyUsage(
 	ctx context.Context,
 	req *connect.Request[v1.GetMyUsageRequest],
@@ -125,20 +133,19 @@ func (h *DashboardHandler) GetMyUsage(
 		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("not authenticated"))
 	}
 
-	// Resolve the user's store ID (Firestore doc ID = sanitized email).
-	// The proxy also writes this same ID into span.user_id, so BQ queries match.
+	// Resolve the user's store ID via the in-process cache (60s TTL).
+	// The proxy writes this same ID into span.user_id, so BQ queries match.
 	var userID string
 	if h.users != nil {
-		user, err := h.users.GetUserByEmail(ctx, authUser.Email)
+		id, err := resolveUserID(ctx, h.users, authUser.Email)
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("user not found"))
 			}
 			return nil, internalError("failed to look up user", err)
 		}
-		userID = user.ID
+		userID = id
 	} else {
-		// No Firestore — use EffectiveID to match the proxy's user_id convention.
 		userID = authUser.EffectiveID()
 	}
 
@@ -162,25 +169,42 @@ func (h *DashboardHandler) GetMyUsage(
 		q.EndTime = time.Now()
 	}
 
-	summary, err := h.store.GetUsageSummary(ctx, q)
-	if err != nil {
-		return nil, internalError("failed to get usage summary", err)
+	// ── BigQuery: usage summary + model breakdown (concurrent) ──────────────
+	type bqResult struct {
+		summary *storage.UsageSummary
+		models  []storage.ModelUsage
+		err     error
+	}
+	bqCh := make(chan bqResult, 1)
+	go func() {
+		models, err := h.store.GetModelBreakdown(ctx, q)
+		if err != nil {
+			bqCh <- bqResult{err: err}
+			return
+		}
+		summary, err := h.store.GetUsageSummary(ctx, q)
+		if err != nil {
+			bqCh <- bqResult{err: err}
+			return
+		}
+		bqCh <- bqResult{summary: summary, models: models}
+	}()
+	bq := <-bqCh
+	if bq.err != nil {
+		return nil, internalError("failed to get usage data", bq.err)
 	}
 
-	models, err := h.store.GetModelBreakdown(ctx, q)
-	if err != nil {
-		return nil, internalError("failed to get model breakdown", err)
+	// Build response — token/cost figures are always from BigQuery.
+	// Budget progress bars and grant remaining: call UserService.GetMyBudget.
+	resp := &v1.GetMyUsageResponse{}
+	if bq.summary != nil {
+		resp.TotalCalls = bq.summary.TotalLLMCalls
+		resp.TotalInputTokens = bq.summary.TotalInputTokens
+		resp.TotalOutputTokens = bq.summary.TotalOutputTokens
+		resp.TotalCostUsd = bq.summary.TotalCostUSD
+		resp.AvgLatencyMs = bq.summary.AvgLatencyMs
 	}
-
-	resp := &v1.GetMyUsageResponse{
-		TotalCalls:        summary.TotalLLMCalls,
-		TotalInputTokens:  summary.TotalInputTokens,
-		TotalOutputTokens: summary.TotalOutputTokens,
-		TotalCostUsd:      summary.TotalCostUSD,
-		AvgLatencyMs:      summary.AvgLatencyMs,
-	}
-
-	for _, m := range models {
+	for _, m := range bq.models {
 		resp.Models = append(resp.Models, &v1.ModelUsage{
 			Model:        m.Model,
 			Provider:     m.Provider,
@@ -191,48 +215,6 @@ func (h *DashboardHandler) GetMyUsage(
 			AvgLatencyMs: m.AvgLatencyMs,
 		})
 	}
-
-	// Attach budget context if Firestore is available.
-	if h.users != nil {
-		// Fetch budget and grants in parallel-safe single-pass:
-		// one GetBudget + one ListGrants (instead of the previous
-		// GetBudget + CheckBudget + ListGrants which called ListGrants twice).
-		budget, err := h.users.GetBudget(ctx, userID)
-		if err == nil && budget != nil {
-			resp.Budget = &typespb.UserBudget{
-				UserId:     budget.UserID,
-				LimitUsd:   budget.LimitUSD,
-				SpentUsd:   budget.SpentUSD,
-				TokensUsed: budget.TokensUsed,
-			}
-		}
-
-		// Fetch active grants (single call — also used to compute remaining).
-		grants, grantErr := h.users.ListGrants(ctx, userID, true)
-		if grantErr != nil {
-			slog.Warn("failed to fetch grants for GetMyUsage", "user_id", userID, "error", grantErr)
-		} else {
-			for _, g := range grants {
-				resp.ActiveGrants = append(resp.ActiveGrants, grantToProto(g))
-			}
-		}
-
-		// Compute total remaining from budget + grants (avoids calling CheckBudget
-		// which internally calls ListGrants again).
-		var totalRemaining float64
-		if budget != nil {
-			budgetRemaining := budget.LimitUSD - budget.SpentUSD
-			if budgetRemaining < 0 {
-				budgetRemaining = 0
-			}
-			totalRemaining += budgetRemaining
-		}
-		for _, g := range grants {
-			totalRemaining += g.Remaining()
-		}
-		resp.TotalRemainingUsd = totalRemaining
-	}
-
 	return connect.NewResponse(resp), nil
 }
 
