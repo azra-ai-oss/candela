@@ -14,6 +14,7 @@ package firestoredb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -483,7 +484,16 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 
 	// Discover and delete all subcollections (Firestore doesn't cascade).
 	// Use a single BulkWriter across all subcollections for efficiency.
+	// CRIT-7: collect individual write result futures so errors are not
+	// silently swallowed when bw.End() flushes the queue.
 	bw := s.client.BulkWriter(ctx)
+	type deleteJob struct {
+		collID string
+		docID  string
+		job    *firestore.BulkWriterJob
+	}
+	var jobs []deleteJob
+
 	collIter := userRef.Collections(ctx)
 	for {
 		collRef, err := collIter.Next()
@@ -506,13 +516,34 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 				bw.End()
 				return fmt.Errorf("firestoredb: iterating subcollection %s: %w", collRef.ID, err)
 			}
-			if _, err := bw.Delete(docRef); err != nil {
+			job, err := bw.Delete(docRef)
+			if err != nil {
+				// Enqueue error (pre-flight validation) — doc ref is invalid.
 				slog.WarnContext(ctx, "bulk delete enqueue failed",
 					"collection", collRef.ID, "doc", docRef.ID, "error", err)
+				continue
 			}
+			jobs = append(jobs, deleteJob{collID: collRef.ID, docID: docRef.ID, job: job})
 		}
 	}
+	// Flush all enqueued deletes and wait for results.
 	bw.End()
+
+	// Check each write result for errors — previously these were silently ignored.
+	var errs []error
+	for _, j := range jobs {
+		if _, err := j.job.Results(); err != nil {
+			slog.ErrorContext(ctx, "bulk delete write failed",
+				"collection", j.collID, "doc", j.docID, "error", err)
+			errs = append(errs, fmt.Errorf("%s/%s: %w", j.collID, j.docID, err))
+		}
+	}
+	if len(errs) > 0 {
+		// Return all errors via errors.Join so the caller can inspect the full
+		// set of failures (Go 1.20+). Orphaned docs are preferable to silently
+		// succeeding with partial deletion — caller can retry DeleteUser.
+		return fmt.Errorf("firestoredb: %d subcollection doc(s) failed to delete: %w", len(errs), errors.Join(errs...))
+	}
 
 	// Delete the user document.
 	if _, err := userRef.Delete(ctx); err != nil {
@@ -643,6 +674,24 @@ func (s *Store) ResetSpend(ctx context.Context, userID string) error {
 	if err != nil {
 		return fmt.Errorf("firestoredb: resetting spend: %w", err)
 	}
+
+	// CRIT-12 (Option 3): Clear the soft_blocked flag set by DeductSpend
+	// when an overdraft was detected. Admin calling ResetSpend is explicitly
+	// acknowledging the overdraft and unblocking the user.
+	configRef := s.client.Collection(usersCol).Doc(userID).
+		Collection(budgetsCol).Doc(budgetConfigDocID)
+	_, err = configRef.Set(ctx, map[string]any{
+		"soft_blocked":    false,
+		"soft_blocked_at": nil,
+	}, firestore.Merge(
+		firestore.FieldPath{"soft_blocked"},
+		firestore.FieldPath{"soft_blocked_at"},
+	))
+	if err != nil {
+		// Non-fatal: log but don't fail ResetSpend — spend is already cleared.
+		slog.Warn("ResetSpend: failed to clear soft_blocked flag",
+			"user_id", userID, "error", err)
+	}
 	return nil
 }
 
@@ -748,6 +797,27 @@ func (s *Store) CheckBudget(ctx context.Context, userID string, estimatedCostUSD
 		}, nil
 	}
 
+	// CRIT-12 (Option 3): Check soft_blocked flag on the config doc.
+	// DeductSpend sets this atomically when an overdraft is detected (i.e. a
+	// concurrent request drained the pool between CheckBudget and DeductSpend).
+	// This flag fires on the NEXT request after an overdraft, not the one that
+	// caused it — that's the inherent limit of Option 3 vs a full atomic merge.
+	// An admin calling ResetSpend clears the flag.
+	sanitizedUID := sanitizeID(userID)
+	configRef := s.client.Collection(usersCol).Doc(sanitizedUID).
+		Collection(budgetsCol).Doc(budgetConfigDocID)
+	if configSnap, err := configRef.Get(ctx); err == nil && configSnap.Exists() {
+		if blocked, _ := configSnap.Data()["soft_blocked"].(bool); blocked {
+			slog.Warn("CheckBudget: user soft-blocked due to overdraft — admin must call ResetSpend",
+				"user_id", sanitizedUID)
+			return &storage.BudgetCheckResult{
+				Allowed:       false,
+				RemainingUSD:  0,
+				EstimatedCost: estimatedCostUSD,
+			}, nil
+		}
+	}
+
 	// Sum remaining grants.
 	grants, err := s.ListGrants(ctx, userID, true)
 	if err != nil {
@@ -785,7 +855,11 @@ func (s *Store) DeductSpend(ctx context.Context, userID string, costUSD float64,
 	// CRIT-5: capture time.Now() once before the transaction so retries see
 	// a consistent timestamp (avoids crossing a minute boundary on retry).
 	now := time.Now().UTC()
-	return s.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+	// CRIT-6: bound the transaction with a timeout so a slow or contended
+	// Firestore call can't block the proxy goroutine indefinitely.
+	txCtx, txCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer txCancel()
+	return s.client.RunTransaction(txCtx, func(ctx context.Context, tx *firestore.Transaction) error {
 		// ── ALL READS FIRST (Firestore requirement) ──
 
 		// Sanitize into a local so we don't mutate the outer parameter.
@@ -949,17 +1023,32 @@ func (s *Store) DeductSpend(ctx context.Context, userID string, costUSD float64,
 			remaining -= deduct
 		}
 
-		// CRIT-12: log a structured warning when spend exceeds available balance.
-		// This happens when a concurrent request drained the budget/grants between
-		// CheckBudget passing and this DeductSpend transaction committing (TOCTOU).
-		// We can't roll back the LLM call, but we create an audit trail and
-		// surface the amount that couldn't be absorbed by any pool.
+		// CRIT-12 (Option 3): If cost couldn't be fully absorbed, it means the
+		// budget/grants were exhausted between CheckBudget passing and this
+		// DeductSpend transaction committing (classic TOCTOU race).
+		// We can't undo the LLM call, but we:
+		//   1. Log a structured warning for ops reconciliation.
+		//   2. Atomically set soft_blocked=true on the config doc so the NEXT
+		//      request from this user is denied immediately by CheckBudget.
+		//      This is within the same transaction — no extra round-trip.
+		// An admin calling ResetSpend will clear the flag.
 		if remaining > 0.000001 { // floating-point epsilon for near-zero residuals
-			slog.Warn("deduct_spend: unabsorbed cost — balance was exhausted by concurrent request",
+			slog.Warn("deduct_spend: unabsorbed cost — balance exhausted by concurrent request; user soft-blocked",
 				"user_id", localUserID,
 				"total_cost_usd", costUSD,
 				"unabsorbed_usd", remaining,
 			)
+			// Write soft_blocked flag atomically into the config doc.
+			// MergeAll preserves all other config fields (limit_usd, period_type…).
+			if err := tx.Set(configRef, map[string]any{
+				"soft_blocked":    true,
+				"soft_blocked_at": now,
+			}, firestore.MergeAll); err != nil {
+				// Non-fatal: if this write fails the deduction already landed.
+				// Log at ERROR so ops know the block didn't persist.
+				slog.Error("deduct_spend: failed to set soft_blocked flag — user NOT blocked",
+					"user_id", localUserID, "error", err)
+			}
 		}
 
 		return nil
@@ -992,12 +1081,21 @@ func (s *Store) CheckRateLimit(ctx context.Context, userID string) (bool, int, i
 	}
 
 	// Window key: minute-level granularity.
-	userID = sanitizeID(userID)
-	windowKey := fmt.Sprintf("%s:%s", userID, time.Now().UTC().Format("2006-01-02T15:04"))
+	// CRIT-4: use `sanitized` consistently — `userID` was already sanitized
+	// above. The previous re-sanitization on the outer param was redundant
+	// dead code (sanitizeID is idempotent but misleading to re-call).
+	// CRIT-5 (rate limit): capture now and windowKey before the transaction so
+	// retries see the same minute bucket even if a retry crosses a minute boundary.
+	now := time.Now().UTC()
+	windowKey := fmt.Sprintf("%s:%s", sanitized, now.Format("2006-01-02T15:04"))
 	ref := s.client.Collection(rateLimitCol).Doc(windowKey)
 
 	var count int
-	err := s.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+	// CRIT-6: bound the rate-limit transaction with a timeout — this runs on
+	// the hot proxy path; a stuck Firestore call would block every request.
+	rlCtx, rlCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer rlCancel()
+	err := s.client.RunTransaction(rlCtx, func(ctx context.Context, tx *firestore.Transaction) error {
 		snap, err := tx.Get(ref)
 		if err != nil && status.Code(err) != codes.NotFound {
 			return err
@@ -1012,11 +1110,11 @@ func (s *Store) CheckRateLimit(ctx context.Context, userID string) (bool, int, i
 
 		count++
 		return tx.Set(ref, map[string]any{
-			"user_id":       userID,
+			"user_id":       sanitized,
 			"request_count": count,
 			"limit":         limit,
 			"window_key":    windowKey,
-			"expire_at":     time.Now().UTC().Add(2 * time.Minute),
+			"expire_at":     now.Add(2 * time.Minute),
 		})
 	})
 	if err != nil {
